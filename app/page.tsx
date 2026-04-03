@@ -1,10 +1,18 @@
 "use client";
 
-import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
+import { Settings } from "lucide-react";
 
 import { ChatSidebar } from "@/components/chat/ChatSidebar";
 import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
+import { McpToolPanel } from "@/components/chat/McpToolPanel";
+import { ToolCallMessage } from "@/components/chat/ToolCallMessage";
 import { useChat } from "@/hooks/useChat";
+import { useMcpServers } from "@/hooks/useMcpServers";
+import { useMcpStatus } from "@/hooks/useMcpStatus";
+import { useMcpTools } from "@/hooks/useMcpTools";
+import { useModelSelect } from "@/hooks/useModelSelect";
 import { cn } from "@/lib/utils";
 
 export default function Home() {
@@ -25,25 +33,66 @@ export default function Home() {
     restoreSession,
     moveSession,
   } = useChat();
+
+  const { servers } = useMcpServers();
+  const serverIds = servers.map((s) => s.id);
+  const { statuses, connect, ready: mcpReady } = useMcpStatus(serverIds);
+  const {
+    tools: mcpTools,
+    enabledTools,
+    toggleTool,
+    enableAll,
+    disableAll,
+    isToolEnabled,
+    refresh: refreshTools,
+  } = useMcpTools();
+
+  const { selectedModel, selectedModelOption, models, setModel } = useModelSelect();
+
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const autoConnectedRef = useRef(false);
+
+  useEffect(() => {
+    if (!mcpReady || autoConnectedRef.current || servers.length === 0) return;
+    autoConnectedRef.current = true;
+
+    const enabledIdleServers = servers.filter(
+      (s) => s.enabled && (!statuses[s.id] || statuses[s.id].status === "idle"),
+    );
+    for (const server of enabledIdleServers) {
+      connect(server);
+    }
+  }, [mcpReady, servers, statuses, connect]);
+
+  useEffect(() => {
+    const connectedCount = Object.values(statuses).filter(
+      (s) => s.status === "connected",
+    ).length;
+    if (connectedCount > 0) {
+      refreshTools();
+    }
+  }, [statuses, refreshTools]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [isStreaming, messages]);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  const handleSubmit = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
 
-    const nextValue = input.trim();
+      const nextValue = input.trim();
 
-    if (!nextValue) {
-      return;
-    }
+      if (!nextValue) {
+        return;
+      }
 
-    setInput("");
-    await sendMessage(nextValue);
-  }
+      setInput("");
+      await sendMessage(nextValue, enabledTools, selectedModel);
+    },
+    [input, sendMessage, enabledTools, selectedModel],
+  );
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -75,9 +124,25 @@ export default function Home() {
                 {activeSession?.title ?? "간단한 AI 채팅 앱"}
               </h1>
             </div>
-            <p className="text-xs text-zinc-500">
-              활성 섹션 {visibleSessions.length}개 / 전체 {sessions.length}개
-            </p>
+            <div className="flex items-center gap-2">
+              <McpToolPanel
+                tools={mcpTools}
+                isToolEnabled={isToolEnabled}
+                onToggle={toggleTool}
+                onEnableAll={enableAll}
+                onDisableAll={disableAll}
+              />
+              <p className="hidden text-xs text-zinc-500 sm:block">
+                세션 {visibleSessions.length}/{sessions.length}
+              </p>
+              <Link
+                href="/settings"
+                className="rounded-full border border-white/10 p-1.5 text-zinc-400 transition hover:bg-white/10 hover:text-zinc-100"
+                aria-label="MCP 서버 설정"
+              >
+                <Settings className="h-4 w-4" />
+              </Link>
+            </div>
           </header>
 
           <section className="border-b border-white/10 bg-amber-500/10 px-4 py-2 text-xs text-amber-100 sm:px-5">
@@ -99,6 +164,8 @@ export default function Home() {
                   isAssistant &&
                   isStreaming &&
                   index === messages.length - 1;
+                const hasToolCalls =
+                  isAssistant && (message.toolCalls ?? []).length > 0;
 
                 return (
                   <article
@@ -119,11 +186,20 @@ export default function Home() {
                       <p className="mb-1 text-xs uppercase tracking-[0.2em] text-white/60">
                         {isAssistant ? "assistant" : "user"}
                       </p>
+
+                      {hasToolCalls && (
+                        <ToolCallMessage toolCalls={message.toolCalls!} />
+                      )}
+
                       {isAssistant ? (
-                        <MarkdownMessage
-                          content={message.content}
-                          isStreaming={isStreamingBubble}
-                        />
+                        message.content ? (
+                          <MarkdownMessage
+                            content={message.content}
+                            isStreaming={isStreamingBubble}
+                          />
+                        ) : isStreamingBubble && !hasToolCalls ? (
+                          <p className="text-zinc-400">응답을 생성하는 중입니다.</p>
+                        ) : null
                       ) : (
                         <p className="whitespace-pre-wrap break-words">
                           {message.content || "응답을 생성하는 중입니다."}
@@ -170,9 +246,27 @@ export default function Home() {
               />
 
               <div className="flex items-center justify-between gap-3">
-                <p className="text-xs text-zinc-500">
-                  모델: <span className="font-medium text-zinc-300">gemini-2.5-flash-lite</span>
-                </p>
+                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                  <select
+                    value={selectedModel}
+                    onChange={(e) => setModel(e.target.value)}
+                    disabled={isStreaming}
+                    className="max-w-[180px] cursor-pointer truncate rounded-lg border border-white/10 bg-black/40 px-2 py-1 text-xs font-medium text-zinc-300 outline-none transition hover:border-white/20 focus:border-blue-400 focus:ring-1 focus:ring-blue-400/30 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label="LLM 모델 선택"
+                    title={selectedModelOption.description}
+                  >
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}
+                      </option>
+                    ))}
+                  </select>
+                  {enabledTools.length > 0 && (
+                    <span className="text-blue-400">
+                      도구 {enabledTools.length}개 활성
+                    </span>
+                  )}
+                </div>
                 <div className="flex gap-3">
                   {isStreaming ? (
                     <button

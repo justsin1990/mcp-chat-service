@@ -25,6 +25,24 @@ const markdownComponents: Components = {
       </a>
     );
   },
+  img({ src, alt }) {
+    if (!src) return null;
+    return (
+      <a
+        href={src}
+        target="_blank"
+        rel="noreferrer"
+        className="my-2 block overflow-hidden rounded-xl border border-white/10 transition hover:border-white/30"
+      >
+        <img
+          src={src}
+          alt={alt ?? "이미지"}
+          className="max-h-96 max-w-full rounded-xl object-contain"
+          loading="lazy"
+        />
+      </a>
+    );
+  },
   code({ children, className, ...props }) {
     const value = String(children).replace(/\n$/, "");
     const language = /language-([\w-]+)/.exec(className ?? "")?.[1];

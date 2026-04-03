@@ -3,12 +3,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ApiErrorBody } from "@/lib/errors";
-import type { ChatSession, ChatStore, Message } from "@/lib/types/chat";
+import type { ChatSession, ChatStore, Message, ToolCallPart } from "@/lib/types/chat";
 
 const STORAGE_KEY = "mcp-chat-service:chat-store";
 const LEGACY_STORAGE_KEY = "mcp-chat-service:messages";
 const DEFAULT_CHAT_TITLE = "새 채팅";
 const INITIAL_SESSION_ID = "initial-session";
+
+interface EnabledTool {
+  serverId: string;
+  toolName: string;
+}
 
 interface UseChatReturn {
   sessions: ChatSession[];
@@ -19,7 +24,7 @@ interface UseChatReturn {
   messages: Message[];
   error: string | null;
   isStreaming: boolean;
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, enabledTools?: EnabledTool[], model?: string) => Promise<void>;
   cancelStream: () => void;
   createSession: () => void;
   selectSession: (sessionId: string) => void;
@@ -251,7 +256,7 @@ export function useChat(): UseChatReturn {
   );
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, enabledTools?: EnabledTool[], model?: string) => {
       const trimmed = content.trim();
       const session = store.sessions.find(
         (currentSession) =>
@@ -314,6 +319,8 @@ export function useChat(): UseChatReturn {
           },
           body: JSON.stringify({
             messages: contextMessages,
+            enabledTools: enabledTools ?? [],
+            model,
           }),
           signal: controller.signal,
         });
@@ -356,6 +363,73 @@ export function useChat(): UseChatReturn {
             return;
           }
 
+          if (event.event === "tool_call") {
+            const payload = parseStreamPayload(event.data);
+            const toolCall: ToolCallPart = {
+              id: typeof payload.id === "string" ? payload.id : crypto.randomUUID(),
+              serverId: typeof payload.serverId === "string" ? payload.serverId : "",
+              serverName: typeof payload.serverName === "string" ? payload.serverName : "unknown",
+              name: typeof payload.name === "string" ? payload.name : "",
+              args: (typeof payload.args === "object" && payload.args !== null
+                ? payload.args
+                : {}) as Record<string, unknown>,
+              status: "running",
+            };
+
+            setStore((current) => ({
+              ...current,
+              sessions: current.sessions.map((currentSession) =>
+                currentSession.id === sessionId
+                  ? {
+                      ...currentSession,
+                      updatedAt: Date.now(),
+                      messages: currentSession.messages.map((message) =>
+                        message.id === assistantMessage.id
+                          ? {
+                              ...message,
+                              toolCalls: [...(message.toolCalls ?? []), toolCall],
+                            }
+                          : message,
+                      ),
+                    }
+                  : currentSession,
+              ),
+            }));
+            return;
+          }
+
+          if (event.event === "tool_result") {
+            const payload = parseStreamPayload(event.data);
+            const toolCallId = typeof payload.id === "string" ? payload.id : "";
+            const result = payload.result;
+            const isError = payload.isError === true;
+
+            setStore((current) => ({
+              ...current,
+              sessions: current.sessions.map((currentSession) =>
+                currentSession.id === sessionId
+                  ? {
+                      ...currentSession,
+                      updatedAt: Date.now(),
+                      messages: currentSession.messages.map((message) =>
+                        message.id === assistantMessage.id
+                          ? {
+                              ...message,
+                              toolCalls: (message.toolCalls ?? []).map((tc) =>
+                                tc.id === toolCallId
+                                  ? { ...tc, result, isError, status: isError ? "error" as const : "done" as const }
+                                  : tc,
+                              ),
+                            }
+                          : message,
+                      ),
+                    }
+                  : currentSession,
+              ),
+            }));
+            return;
+          }
+
           if (event.event === "error") {
             const payload = parseStreamPayload(event.data);
             const message =
@@ -379,9 +453,9 @@ export function useChat(): UseChatReturn {
                   ...currentSession,
                   updatedAt: Date.now(),
                   messages: currentSession.messages.filter((message) => {
-                    return !(
-                      message.id === assistantMessage.id && message.content.length === 0
-                    );
+                    if (message.id !== assistantMessage.id) return true;
+                    const hasToolCalls = (message.toolCalls ?? []).length > 0;
+                    return message.content.length > 0 || hasToolCalls;
                   }),
                 }
               : currentSession,
