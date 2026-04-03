@@ -1,10 +1,24 @@
 export type Role = "user" | "assistant";
 
+export type ToolCallStatus = "pending" | "running" | "done" | "error";
+
+export interface ToolCallPart {
+  id: string;
+  serverId: string;
+  serverName: string;
+  name: string;
+  args: Record<string, unknown>;
+  result?: unknown;
+  isError?: boolean;
+  status: ToolCallStatus;
+}
+
 export interface Message {
   id: string;
   role: Role;
   content: string;
   createdAt: number;
+  toolCalls?: ToolCallPart[];
 }
 
 export interface ChatSession {

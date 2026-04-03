@@ -2,6 +2,7 @@ export type ApiErrorCode =
   | "INVALID_REQUEST"
   | "RATE_LIMITED"
   | "LLM_ERROR"
+  | "MCP_ERROR"
   | "INTERNAL_ERROR";
 
 export interface ApiErrorBody {
