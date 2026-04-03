@@ -102,8 +102,8 @@ export default function Home() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-zinc-950 px-4 py-6 text-zinc-50 sm:px-6">
-      <div className="flex h-[min(88vh,860px)] w-full max-w-6xl overflow-hidden rounded-3xl border border-white/10 bg-white/5 shadow-2xl backdrop-blur">
+    <main className="flex h-screen bg-zinc-950 text-zinc-50">
+      <div className="flex h-full w-full overflow-hidden bg-white/5">
         <ChatSidebar
           sessions={visibleSessions}
           deletedSessions={deletedSessions}
@@ -145,9 +145,9 @@ export default function Home() {
             </div>
           </header>
 
-          <section className="border-b border-white/10 bg-amber-500/10 px-4 py-2 text-xs text-amber-100 sm:px-5">
-            채팅 내역은 현재 브라우저의 localStorage에 저장됩니다. 공용 PC에서는
-            민감한 내용을 입력하지 마세요.
+          <section className="border-b border-white/10 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-100 sm:px-5">
+            채팅 내역은 Supabase 데이터베이스에 저장됩니다. 민감한 내용을 입력하지
+            마세요.
           </section>
 
           <section className="min-h-0 flex-1 px-4 py-4 sm:px-5">

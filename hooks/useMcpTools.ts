@@ -1,10 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type { McpToolWithServer } from "@/lib/types/mcp";
+import { fetchToolPrefs, upsertToolPrefs } from "@/lib/db/tool-prefs";
 
-const STORAGE_KEY = "mcp-chat-service:mcp-tool-prefs";
 const POLL_INTERVAL_MS = 5_000;
 
 interface ToolPrefs {
@@ -25,34 +25,9 @@ function toolKey(serverId: string, toolName: string): string {
   return `${serverId}::${toolName}`;
 }
 
-function loadPrefs(): ToolPrefs {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      const parsed = JSON.parse(stored) as unknown;
-      if (typeof parsed === "object" && parsed !== null) {
-        return parsed as ToolPrefs;
-      }
-    }
-  } catch {
-    // 파싱 실패 시 빈 객체
-  }
-  return {};
-}
-
-function savePrefs(prefs: ToolPrefs): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
-  } catch {
-    // 저장 실패 무시
-  }
-}
-
 export function useMcpTools(): UseMcpToolsReturn {
   const [tools, setTools] = useState<McpToolWithServer[]>([]);
   const [prefs, setPrefs] = useState<ToolPrefs>({});
-  const prefsRef = useRef(prefs);
-  prefsRef.current = prefs;
 
   const fetchTools = useCallback(async () => {
     try {
@@ -66,7 +41,11 @@ export function useMcpTools(): UseMcpToolsReturn {
   }, []);
 
   useEffect(() => {
-    setPrefs(loadPrefs());
+    fetchToolPrefs()
+      .then((loaded) => setPrefs(loaded))
+      .catch(() => {
+        // 로드 실패 시 빈 객체 유지
+      });
   }, []);
 
   useEffect(() => {
@@ -88,7 +67,7 @@ export function useMcpTools(): UseMcpToolsReturn {
       setPrefs((prev) => {
         const key = toolKey(serverId, toolName);
         const next = { ...prev, [key]: prev[key] === false };
-        savePrefs(next);
+        upsertToolPrefs(next);
         return next;
       });
     },
@@ -98,7 +77,7 @@ export function useMcpTools(): UseMcpToolsReturn {
   const enableAll = useCallback(() => {
     setPrefs(() => {
       const next: ToolPrefs = {};
-      savePrefs(next);
+      upsertToolPrefs(next);
       return next;
     });
   }, []);
@@ -109,7 +88,7 @@ export function useMcpTools(): UseMcpToolsReturn {
       for (const t of tools) {
         next[toolKey(t.serverId, t.tool.name)] = false;
       }
-      savePrefs(next);
+      upsertToolPrefs(next);
       return next;
     });
   }, [tools]);

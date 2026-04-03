@@ -202,6 +202,8 @@ function extractImages(result: unknown): ExtractedImage[] {
         src: `data:${item.mimeType};base64,${item.data}`,
         alt: "도구 생성 이미지",
       });
+    } else if (item.type === "image" && item.text && isImageUrl(item.text)) {
+      images.push({ src: item.text, alt: "도구 생성 이미지" });
     }
     if (item.type === "text" && item.text) {
       for (const url of extractImageUrls(item.text)) {
@@ -210,6 +212,15 @@ function extractImages(result: unknown): ExtractedImage[] {
     }
   }
   return images;
+}
+
+function isImageUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
 }
 
 const IMAGE_URL_RE =

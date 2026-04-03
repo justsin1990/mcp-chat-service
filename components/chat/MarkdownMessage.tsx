@@ -29,13 +29,13 @@ const markdownComponents: Components = {
     if (!src) return null;
     return (
       <a
-        href={src}
+        href={typeof src === "string" ? src : undefined}
         target="_blank"
         rel="noreferrer"
         className="my-2 block overflow-hidden rounded-xl border border-white/10 transition hover:border-white/30"
       >
         <img
-          src={src}
+          src={typeof src === "string" ? src : undefined}
           alt={alt ?? "이미지"}
           className="max-h-96 max-w-full rounded-xl object-contain"
           loading="lazy"

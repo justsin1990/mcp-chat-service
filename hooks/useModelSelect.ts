@@ -4,8 +4,9 @@ import { useCallback, useEffect, useState } from "react";
 
 import { AVAILABLE_MODELS, DEFAULT_MODEL_ID, isValidModel } from "@/lib/models";
 import type { ModelOption } from "@/lib/models";
+import { getSetting, setSetting } from "@/lib/db/settings";
 
-const STORAGE_KEY = "mcp-chat-service:selected-model";
+const SETTING_KEY = "selected-model";
 
 interface UseModelSelectReturn {
   selectedModel: string;
@@ -18,24 +19,21 @@ export function useModelSelect(): UseModelSelectReturn {
   const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL_ID);
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored && isValidModel(stored)) {
-        setSelectedModel(stored);
-      }
-    } catch {
-      // localStorage 접근 실패 시 기본값 유지
-    }
+    getSetting(SETTING_KEY)
+      .then((stored) => {
+        if (stored && isValidModel(stored)) {
+          setSelectedModel(stored);
+        }
+      })
+      .catch(() => {
+        // 로드 실패 시 기본값 유지
+      });
   }, []);
 
   const setModel = useCallback((modelId: string) => {
     if (!isValidModel(modelId)) return;
     setSelectedModel(modelId);
-    try {
-      localStorage.setItem(STORAGE_KEY, modelId);
-    } catch {
-      // 저장 실패 무시
-    }
+    setSetting(SETTING_KEY, modelId);
   }, []);
 
   const selectedModelOption =

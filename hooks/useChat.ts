@@ -4,11 +4,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ApiErrorBody } from "@/lib/errors";
 import type { ChatSession, ChatStore, Message, ToolCallPart } from "@/lib/types/chat";
+import {
+  deleteMessage,
+  fetchActiveSessionId,
+  fetchAllSessions,
+  insertMessage,
+  insertSession,
+  restoreSessionInDb,
+  saveActiveSessionId,
+  softDeleteSession,
+  updateMessage,
+  updateSession,
+  updateSessionPositions,
+} from "@/lib/db/chat";
+import { uploadBase64Image } from "@/lib/db/storage";
 
-const STORAGE_KEY = "mcp-chat-service:chat-store";
-const LEGACY_STORAGE_KEY = "mcp-chat-service:messages";
 const DEFAULT_CHAT_TITLE = "새 채팅";
-const INITIAL_SESSION_ID = "initial-session";
 
 interface EnabledTool {
   serverId: string;
@@ -40,12 +51,11 @@ interface StreamEvent {
 
 export function useChat(): UseChatReturn {
   const [store, setStore] = useState<ChatStore>({
-    sessions: [createInitialSession()],
-    activeSessionId: INITIAL_SESSION_ID,
+    sessions: [],
+    activeSessionId: null,
   });
   const [error, setError] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [hasLoaded, setHasLoaded] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const activeSession =
     store.sessions.find((session) => session.id === store.activeSessionId) ?? null;
@@ -54,92 +64,68 @@ export function useChat(): UseChatReturn {
   const messages = activeSession?.messages ?? [];
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
+    let cancelled = false;
 
-      if (stored) {
-        const parsed = JSON.parse(stored) as Partial<ChatStore>;
+    async function load() {
+      try {
+        const [sessions, savedActiveId] = await Promise.all([
+          fetchAllSessions(),
+          fetchActiveSessionId(),
+        ]);
 
-        if (isValidChatStore(parsed)) {
-          setStore(ensureActiveSession(normalizeStore(parsed)));
-          setHasLoaded(true);
-          return;
-        }
-      }
+        if (cancelled) return;
 
-      const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
-
-      if (legacy) {
-        const parsed = JSON.parse(legacy) as Message[];
-
-        if (Array.isArray(parsed)) {
-          const migratedSession = createSessionRecord(parsed);
-
-          setStore({
-            sessions: [migratedSession],
-            activeSessionId: migratedSession.id,
+        if (sessions.length === 0) {
+          const initial = createSessionRecord();
+          await insertSession(initial, 0);
+          if (cancelled) return;
+          setStore({ sessions: [initial], activeSessionId: initial.id });
+          await saveActiveSessionId(initial.id);
+        } else {
+          const resolved = ensureActiveSession({
+            sessions,
+            activeSessionId: savedActiveId,
           });
-          localStorage.removeItem(LEGACY_STORAGE_KEY);
-          setHasLoaded(true);
-          return;
+          setStore(resolved);
+          if (resolved.activeSessionId !== savedActiveId) {
+            await saveActiveSessionId(resolved.activeSessionId);
+          }
+        }
+      } catch {
+        const initial = createSessionRecord();
+        if (!cancelled) {
+          setStore({ sessions: [initial], activeSessionId: initial.id });
         }
       }
-
-      const initialSession = createSessionRecord();
-
-      setStore({
-        sessions: [initialSession],
-        activeSessionId: initialSession.id,
-      });
-    } catch {
-      const initialSession = createSessionRecord();
-
-      localStorage.removeItem(STORAGE_KEY);
-      localStorage.removeItem(LEGACY_STORAGE_KEY);
-      setStore({
-        sessions: [initialSession],
-        activeSessionId: initialSession.id,
-      });
-    } finally {
-      setHasLoaded(true);
     }
+
+    load();
+    return () => { cancelled = true; };
   }, []);
-
-  useEffect(() => {
-    if (!hasLoaded) {
-      return;
-    }
-
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-    } catch {
-      // 저장 실패 시 메모리 상태는 유지한다.
-    }
-  }, [hasLoaded, store]);
 
   const cancelStream = useCallback(() => {
     abortRef.current?.abort();
   }, []);
 
   const createSession = useCallback(() => {
-    if (isStreaming) {
-      return;
-    }
+    if (isStreaming) return;
 
     const nextSession = createSessionRecord();
 
-    setStore((current) => ({
-      sessions: [nextSession, ...current.sessions],
-      activeSessionId: nextSession.id,
-    }));
+    setStore((current) => {
+      const newSessions = [nextSession, ...current.sessions];
+      insertSession(nextSession, 0).then(() =>
+        updateSessionPositions(newSessions.map((s) => s.id)),
+      );
+      saveActiveSessionId(nextSession.id);
+      return { sessions: newSessions, activeSessionId: nextSession.id };
+    });
     setError(null);
   }, [isStreaming]);
 
   const selectSession = useCallback(
     (sessionId: string) => {
-      if (isStreaming) {
-        return;
-      }
+      if (isStreaming) return;
 
       setStore((current) => {
         if (
@@ -150,32 +136,28 @@ export function useChat(): UseChatReturn {
           return current;
         }
 
-        return {
-          ...current,
-          activeSessionId: sessionId,
-        };
+        saveActiveSessionId(sessionId);
+        return { ...current, activeSessionId: sessionId };
       });
       setError(null);
     },
     [isStreaming],
   );
 
-  const deleteSession = useCallback(
+  const deleteSessionHandler = useCallback(
     (sessionId: string) => {
-      if (isStreaming) {
-        return;
-      }
+      if (isStreaming) return;
 
       setStore((current) => {
         const target = current.sessions.find((session) => session.id === sessionId);
+        if (!target || target.deletedAt !== null) return current;
 
-        if (!target || target.deletedAt !== null) {
-          return current;
-        }
+        const now = Date.now();
+        softDeleteSession(sessionId);
 
         const nextSessions = current.sessions.map((session) =>
           session.id === sessionId
-            ? { ...session, deletedAt: Date.now(), updatedAt: Date.now() }
+            ? { ...session, deletedAt: now, updatedAt: now }
             : session,
         );
         const visibleAfterDelete = nextSessions.filter(
@@ -184,7 +166,10 @@ export function useChat(): UseChatReturn {
 
         if (visibleAfterDelete.length === 0) {
           const fallbackSession = createSessionRecord();
-
+          insertSession(fallbackSession, 0).then(() =>
+            updateSessionPositions([fallbackSession.id, ...nextSessions.map((s) => s.id)]),
+          );
+          saveActiveSessionId(fallbackSession.id);
           return {
             sessions: [fallbackSession, ...nextSessions],
             activeSessionId: fallbackSession.id,
@@ -196,22 +181,22 @@ export function useChat(): UseChatReturn {
             ? visibleAfterDelete[0].id
             : current.activeSessionId;
 
-        return {
-          sessions: nextSessions,
-          activeSessionId: nextActiveId,
-        };
+        if (current.activeSessionId === sessionId) {
+          saveActiveSessionId(nextActiveId);
+        }
+
+        return { sessions: nextSessions, activeSessionId: nextActiveId };
       });
     },
     [isStreaming],
   );
 
-  const restoreSession = useCallback((sessionId: string) => {
+  const restoreSessionHandler = useCallback((sessionId: string) => {
     setStore((current) => {
       const target = current.sessions.find((session) => session.id === sessionId);
+      if (!target || target.deletedAt === null) return current;
 
-      if (!target || target.deletedAt === null) {
-        return current;
-      }
+      restoreSessionInDb(sessionId);
 
       return ensureActiveSession({
         sessions: current.sessions.map((session) =>
@@ -226,9 +211,7 @@ export function useChat(): UseChatReturn {
 
   const moveSession = useCallback(
     (fromId: string, toId: string) => {
-      if (isStreaming || fromId === toId) {
-        return;
-      }
+      if (isStreaming || fromId === toId) return;
 
       setStore((current) => {
         const fromIndex = current.sessions.findIndex(
@@ -238,18 +221,15 @@ export function useChat(): UseChatReturn {
           (session) => session.id === toId && session.deletedAt === null,
         );
 
-        if (fromIndex === -1 || toIndex === -1) {
-          return current;
-        }
+        if (fromIndex === -1 || toIndex === -1) return current;
 
         const nextSessions = [...current.sessions];
         const [moved] = nextSessions.splice(fromIndex, 1);
         nextSessions.splice(toIndex, 0, moved);
 
-        return {
-          ...current,
-          sessions: nextSessions,
-        };
+        updateSessionPositions(nextSessions.map((s) => s.id));
+
+        return { ...current, sessions: nextSessions };
       });
     },
     [isStreaming],
@@ -264,9 +244,7 @@ export function useChat(): UseChatReturn {
           currentSession.deletedAt === null,
       );
 
-      if (!trimmed || isStreaming || !session) {
-        return;
-      }
+      if (!trimmed || isStreaming || !session) return;
 
       const sessionId = session.id;
       const userMessage: Message = {
@@ -294,6 +272,13 @@ export function useChat(): UseChatReturn {
 
       setError(null);
       setIsStreaming(true);
+
+      insertMessage(sessionId, userMessage);
+      insertMessage(sessionId, assistantMessage);
+      if (nextTitle !== session.title) {
+        updateSession(sessionId, { title: nextTitle, updatedAt: Date.now() });
+      }
+
       setStore((current) => ({
         ...current,
         sessions: current.sessions.map((currentSession) =>
@@ -314,9 +299,7 @@ export function useChat(): UseChatReturn {
       try {
         const response = await fetch("/api/chat/stream", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages: contextMessages,
             enabledTools: enabledTools ?? [],
@@ -337,12 +320,8 @@ export function useChat(): UseChatReturn {
         await consumeStream(response.body, (event) => {
           if (event.event === "message") {
             const payload = parseStreamPayload(event.data);
-            const text =
-              typeof payload.text === "string" ? payload.text : "";
-
-            if (!text) {
-              return;
-            }
+            const text = typeof payload.text === "string" ? payload.text : "";
+            if (!text) return;
 
             setStore((current) => ({
               ...current,
@@ -436,31 +415,36 @@ export function useChat(): UseChatReturn {
               typeof payload.message === "string"
                 ? payload.message
                 : "응답 생성 중 오류가 발생했습니다.";
-
             throw new Error(message);
           }
         });
-      } catch (error) {
-        if (error instanceof Error && error.name !== "AbortError") {
-          setError(error.message);
+      } catch (err) {
+        if (err instanceof Error && err.name !== "AbortError") {
+          setError(err.message);
         }
       } finally {
-        setStore((current) => ({
-          ...current,
-          sessions: current.sessions.map((currentSession) =>
-            currentSession.id === sessionId
-              ? {
-                  ...currentSession,
-                  updatedAt: Date.now(),
-                  messages: currentSession.messages.filter((message) => {
-                    if (message.id !== assistantMessage.id) return true;
-                    const hasToolCalls = (message.toolCalls ?? []).length > 0;
-                    return message.content.length > 0 || hasToolCalls;
-                  }),
-                }
-              : currentSession,
-          ),
-        }));
+        setStore((current) => {
+          const updatedSessions = current.sessions.map((currentSession) => {
+            if (currentSession.id !== sessionId) return currentSession;
+
+            const filtered = currentSession.messages.filter((message) => {
+              if (message.id !== assistantMessage.id) return true;
+              const hasToolCalls = (message.toolCalls ?? []).length > 0;
+              return message.content.length > 0 || hasToolCalls;
+            });
+
+            const finalAssistant = filtered.find((m) => m.id === assistantMessage.id);
+            if (finalAssistant) {
+              persistAssistantMessage(sessionId, finalAssistant);
+            } else {
+              deleteMessage(assistantMessage.id);
+            }
+
+            return { ...currentSession, updatedAt: Date.now(), messages: filtered };
+          });
+
+          return { ...current, sessions: updatedSessions };
+        });
         setIsStreaming(false);
         abortRef.current = null;
       }
@@ -481,25 +465,20 @@ export function useChat(): UseChatReturn {
     cancelStream,
     createSession,
     selectSession,
-    deleteSession,
-    restoreSession,
+    deleteSession: deleteSessionHandler,
+    restoreSession: restoreSessionHandler,
     moveSession,
   };
 }
 
 function createSessionTitle(content: string): string {
   const normalized = content.replace(/\s+/g, " ").trim();
-
-  if (!normalized) {
-    return DEFAULT_CHAT_TITLE;
-  }
-
+  if (!normalized) return DEFAULT_CHAT_TITLE;
   return normalized.length > 22 ? `${normalized.slice(0, 22)}...` : normalized;
 }
 
 function createSessionRecord(messages: Message[] = []): ChatSession {
   const now = Date.now();
-
   return {
     id: crypto.randomUUID(),
     title:
@@ -513,25 +492,11 @@ function createSessionRecord(messages: Message[] = []): ChatSession {
   };
 }
 
-function createInitialSession(): ChatSession {
-  const now = Date.now();
-
-  return {
-    id: INITIAL_SESSION_ID,
-    title: DEFAULT_CHAT_TITLE,
-    createdAt: now,
-    updatedAt: now,
-    deletedAt: null,
-    messages: [],
-  };
-}
-
 function ensureActiveSession(store: ChatStore): ChatStore {
   const visibleSessions = store.sessions.filter((session) => session.deletedAt === null);
 
   if (visibleSessions.length === 0) {
     const initialSession = createSessionRecord();
-
     return {
       sessions: [initialSession, ...store.sessions],
       activeSessionId: initialSession.id,
@@ -548,27 +513,6 @@ function ensureActiveSession(store: ChatStore): ChatStore {
   };
 }
 
-function isValidChatStore(value: Partial<ChatStore>): value is ChatStore {
-  return (
-    Array.isArray(value.sessions) &&
-    (typeof value.activeSessionId === "string" || value.activeSessionId === null)
-  );
-}
-
-function normalizeStore(store: ChatStore): ChatStore {
-  return {
-    sessions: store.sessions.map((session) => normalizeSession(session)),
-    activeSessionId: store.activeSessionId,
-  };
-}
-
-function normalizeSession(session: ChatSession): ChatSession {
-  return {
-    ...session,
-    deletedAt: session.deletedAt ?? null,
-  };
-}
-
 function buildContextMessages(
   sessions: ChatSession[],
   activeSessionId: string,
@@ -577,10 +521,7 @@ function buildContextMessages(
   const sharedMessages: Message[] = [];
 
   for (const session of sessions) {
-    if (session.deletedAt !== null || session.id === activeSessionId) {
-      continue;
-    }
-
+    if (session.deletedAt !== null || session.id === activeSessionId) continue;
     sharedMessages.push(...session.messages);
   }
 
@@ -598,28 +539,17 @@ async function consumeStream(
   try {
     while (true) {
       const { done, value } = await reader.read();
-
-      if (done) {
-        break;
-      }
+      if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-
       const segments = buffer.split("\n\n");
       buffer = segments.pop() ?? "";
 
       for (const segment of segments) {
         const event = parseEventSegment(segment);
-
-        if (!event) {
-          continue;
-        }
-
+        if (!event) continue;
         onEvent(event);
-
-        if (event.event === "done") {
-          return;
-        }
+        if (event.event === "done") return;
       }
     }
   } finally {
@@ -637,27 +567,96 @@ function parseEventSegment(segment: string): StreamEvent | null {
       event = line.slice(6).trim();
       continue;
     }
-
     if (line.startsWith("data:")) {
       data.push(line.slice(5).trim());
     }
   }
 
-  if (data.length === 0) {
-    return null;
-  }
-
-  return {
-    event,
-    data: data.join("\n"),
-  };
+  if (data.length === 0) return null;
+  return { event, data: data.join("\n") };
 }
 
 function parseStreamPayload(data: string): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(data) as Record<string, unknown>;
-    return parsed;
+    return JSON.parse(data) as Record<string, unknown>;
   } catch {
     return {};
+  }
+}
+
+interface McpContentItem {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+}
+
+interface McpToolResult {
+  content?: McpContentItem[];
+  [key: string]: unknown;
+}
+
+async function uploadToolCallImages(toolCalls: ToolCallPart[]): Promise<ToolCallPart[]> {
+  const results: ToolCallPart[] = [];
+
+  for (const tc of toolCalls) {
+    if (!tc.result || typeof tc.result !== "object") {
+      results.push(tc);
+      continue;
+    }
+
+    const mcpResult = tc.result as McpToolResult;
+    if (!Array.isArray(mcpResult.content)) {
+      results.push(tc);
+      continue;
+    }
+
+    let changed = false;
+    const updatedContent: McpContentItem[] = [];
+
+    for (const item of mcpResult.content) {
+      if (item.type === "image" && item.data && item.mimeType) {
+        const publicUrl = await uploadBase64Image(item.data, item.mimeType);
+        if (publicUrl) {
+          updatedContent.push({
+            type: "image",
+            text: publicUrl,
+            mimeType: item.mimeType,
+          });
+          changed = true;
+          continue;
+        }
+      }
+      updatedContent.push(item);
+    }
+
+    if (changed) {
+      results.push({
+        ...tc,
+        result: { ...mcpResult, content: updatedContent },
+      });
+    } else {
+      results.push(tc);
+    }
+  }
+
+  return results;
+}
+
+async function persistAssistantMessage(sessionId: string, message: Message): Promise<void> {
+  try {
+    let toolCalls = message.toolCalls;
+
+    if (toolCalls && toolCalls.length > 0) {
+      toolCalls = await uploadToolCallImages(toolCalls);
+    }
+
+    await updateMessage(message.id, {
+      content: message.content,
+      toolCalls,
+    });
+    await updateSession(sessionId, { updatedAt: Date.now() });
+  } catch {
+    // DB 저장 실패 시 메모리 상태는 유지
   }
 }
